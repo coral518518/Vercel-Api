@@ -1,6 +1,9 @@
 {
-  "name": "openai-vercel-proxy",
+  "name": "vercel-oneapi-relay",
   "version": "1.0.0",
+  "description": "Universal Relay Proxy for OneAPI on Cloudflare Workers",
   "private": true,
-  "type": "module"
+  "scripts": {
+    "dev": "vercel dev"
+  }
 }
