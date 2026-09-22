@@ -38,11 +38,6 @@ export default async function handler(request) {
             status: 'ok',
             service: 'OneAPI Vercel Secondary Relay',
             message: '二次中转服务正常运行中。已就绪接收来自 Worker 的自动中转请求。',
-            relay_features: {
-              auto_detect: true,
-              supported_headers: ['x-target-url', 'x-upstream-url', 'x-relay-source'],
-              outbound_region: 'AWS us-east-1 (iad1)',
-            },
             time: new Date().toISOString(),
           },
           null,
