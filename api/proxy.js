@@ -1,186 +1,235 @@
 export const config = {
-  // 必须显式声明为 edge 运行时，Vercel 才会传入标准 Web Request 并接收 Web Response
   runtime: 'edge',
-  // 指定部署在 AWS 美东机房 (iad1 - Washington, D.C.)，拥有原生美国公网 IP
-  regions: ['iad1'],
+  regions: ['iad1'], // 严格锁定 AWS 美东机房，拥有原生美国公网 IP
 };
 
-// 兜底上游服务商地址（当没有标头也没有二次中转配置时）
 const DEFAULT_UPSTREAM = 'https://api.openai.com';
+// 可选密钥：若 Vercel 环境变量未配置，会自动降级验证 Worker 特征标头，实现零配置即插即用
+const RELAY_SECRET = (process.env.RELAY_SECRET || '').trim();
 
-/**
- * 通用反向代理处理器：
- * 自动识别 Cloudflare Worker 发来的二次中转请求，读取真实的接口、路径与全部参数，
- * 彻底洗除 Cloudflare 跨区定位指纹，并原生流式返回给 Worker。
- */
+const CORS_HEADERS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS, PATCH',
+  'Access-Control-Allow-Headers': '*',
+  'Access-Control-Expose-Headers': '*',
+  'Access-Control-Max-Age': '86400',
+};
+
+// 严密防御内网与私有 IP 探测
+const PRIVATE_IP_REGEX = /^(localhost|127\.\d+\.\d+\.\d+|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[0-1])\.\d+\.\d+|192\.168\.\d+\.\d+|169\.254\.\d+\.\d+|100\.(6[4-9]|[7-9]\d|1[0-1]\d|12[0-7])\.\d+\.\d+|0\.0\.0\.0|\[?::1\]?|\[?fc00:.*\]?|\[?fe80:.*\]?)$/i;
+
+// 必须剔除的代理痕迹标头（特别注意 cdn-loop，防止触发 OpenAI 的 Cloudflare 循环报错）
+const HOP_HEADERS = new Set([
+  'host',
+  'connection',
+  'cdn-loop', // 关键：截断 Cloudflare 循环调用计数
+  'content-length',
+  'x-target-url',
+  'x-upstream-url',
+  'x-relay-source',
+  'x-relay-secret',
+  'accept-encoding', // 关键：强制明文，防止 Worker 端的 stream.tee() 记账乱码崩溃
+  'via',
+]);
+
+const RESPONSE_HOP_HEADERS = [
+  'connection',
+  'keep-alive',
+  'transfer-encoding',
+  'te',
+  'trailer',
+  'upgrade',
+  'content-length',
+  'content-encoding',
+];
+
+function timingSafeEqual(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) {
+    return false;
+  }
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return diff === 0;
+}
+
+function jsonResponse(data, status = 200, extraHeaders = {}) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      'Content-Type': 'application/json; charset=utf-8',
+      ...CORS_HEADERS,
+      ...extraHeaders,
+    },
+  });
+}
+
+function buildMergedUrl(rawBaseUrl, incomingUrl) {
+  const base = new URL(rawBaseUrl.startsWith('http') ? rawBaseUrl : `https://${rawBaseUrl}`);
+  const cleanBasePath = base.pathname.replace(/\/+$/, '');
+  const cleanIncomingPath = incomingUrl.pathname.replace(/^\/+/, '');
+  base.pathname = cleanBasePath ? `${cleanBasePath}/${cleanIncomingPath}` : `/${cleanIncomingPath}`;
+  
+  for (const [key, val] of incomingUrl.searchParams.entries()) {
+    base.searchParams.set(key, val);
+  }
+  return base;
+}
+
 export default async function handler(request) {
   try {
-    // 1. 处理 CORS 跨域预检请求
-    if (request.method === 'OPTIONS') {
-      return new Response(null, {
-        status: 204,
-        headers: {
-          'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS, PATCH',
-          'Access-Control-Allow-Headers': '*',
-          'Access-Control-Max-Age': '86400',
-        },
-      });
+    const method = request.method.toUpperCase();
+
+    // 1. CORS 跨域处理
+    if (method === 'OPTIONS') {
+      return new Response(null, { status: 204, headers: CORS_HEADERS });
     }
 
     const incomingUrl = new URL(request.url, 'http://localhost');
 
-    // 2. 根路径健康检查（便于在浏览器直接访问验证服务是否正常部署）
-    if (request.method === 'GET' && (incomingUrl.pathname === '/' || incomingUrl.pathname === '')) {
-      return new Response(
-        JSON.stringify(
-          {
-            status: 'ok',
-            service: 'OneAPI Vercel Secondary Relay',
-            message: '二次中转服务正常运行中。已就绪接收来自 Worker 的自动中转请求。',
-            time: new Date().toISOString(),
-          },
-          null,
-          2
-        ),
+    // 2. 健康检查与保活（支持 GET 和 HEAD）
+    if (['GET', 'HEAD'].includes(method) && (incomingUrl.pathname === '/' || incomingUrl.pathname === '')) {
+      if (method === 'HEAD') {
+        return new Response(null, { status: 200, headers: CORS_HEADERS });
+      }
+      return jsonResponse(
         {
-          status: 200,
-          headers: { 'Content-Type': 'application/json; charset=utf-8' },
-        }
+          status: 'ok',
+          service: 'OneAPI Secondary Relay (IAD1)',
+          message: '就绪接收 Cloudflare Worker 中转请求',
+          time: new Date().toISOString(),
+        },
+        200,
+        { 'Cache-Control': 'no-store' }
       );
     }
 
-    // 3. 自动识别来自 Worker 的中转请求与真实目标接口
+    // 3. 针对你的 Worker 进行的智能安全鉴权
+    const clientSecret = request.headers.get('x-relay-secret')?.trim() || '';
+    const relaySource = request.headers.get('x-relay-source');
+    const hasTargetHeader = !!request.headers.get('x-target-url');
+
+    if (RELAY_SECRET) {
+      // 模式 A：如果你配置了密钥，严格进行恒定时间校验
+      if (!timingSafeEqual(clientSecret, RELAY_SECRET)) {
+        return jsonResponse({ error: { message: 'Unauthorized: x-relay-secret 密钥无效' } }, 403);
+      }
+    } else {
+      // 模式 B：未配密钥时，校验你的 Worker 原生发送的 x-relay-source 标识，防范外部无脑公网扫描
+      if (relaySource !== 'cf-worker' && !hasTargetHeader) {
+        return jsonResponse({ error: { message: 'Forbidden: 仅限 OneAPI Cloudflare Worker 中转访问' } }, 403);
+      }
+    }
+
+    // 4. 解析真实目标 URL（优先读取你 Worker 计算好的 x-target-url）
     const targetUrlHeader = request.headers.get('x-target-url');
     const upstreamUrlHeader = request.headers.get('x-upstream-url');
-    const isWorkerRelay =
-      request.headers.get('x-relay-source') === 'cf-worker' || !!targetUrlHeader;
-
     let finalTargetUrl;
 
     if (targetUrlHeader && targetUrlHeader.trim()) {
-      // 【最优先】读取 Worker 解析出的 100% 完整目标 URL（包含真实路径与全部 Query 参数）
       try {
         finalTargetUrl = new URL(targetUrlHeader.trim());
       } catch {
-        finalTargetUrl = new URL(targetUrlHeader.trim(), DEFAULT_UPSTREAM);
+        finalTargetUrl = buildMergedUrl(DEFAULT_UPSTREAM, incomingUrl);
       }
     } else if (upstreamUrlHeader && upstreamUrlHeader.trim()) {
-      // 【次选】读取基础 endpoint，并拼接请求路径与 Query
-      const base = upstreamUrlHeader.trim().replace(/\/+$/, '');
-      const pathAndQuery = incomingUrl.pathname + incomingUrl.search;
-      finalTargetUrl = new URL(base + pathAndQuery);
+      finalTargetUrl = buildMergedUrl(upstreamUrlHeader.trim(), incomingUrl);
     } else {
-      // 【兜底】直接请求本 Vercel 的外部普通调用，默认映射至 OpenAI
-      const base = DEFAULT_UPSTREAM;
-      const pathAndQuery = incomingUrl.pathname + incomingUrl.search;
-      finalTargetUrl = new URL(base + pathAndQuery);
+      finalTargetUrl = buildMergedUrl(DEFAULT_UPSTREAM, incomingUrl);
     }
 
-    console.log(
-      `[Relay] 模式: ${isWorkerRelay ? 'CF Worker 中转' : '直接请求'} -> 真实目标: ${finalTargetUrl.toString()}`
-    );
+    // 5. SSRF 拦截
+    if (!['http:', 'https:'].includes(finalTargetUrl.protocol)) {
+      return jsonResponse({ error: '非法请求协议' }, 400);
+    }
+    const hostname = finalTargetUrl.hostname.toLowerCase();
+    if (PRIVATE_IP_REGEX.test(hostname) || !hostname.includes('.')) {
+      return jsonResponse({ error: '禁止访问私有内网地址' }, 403);
+    }
 
-    // 4. 清洗 Header：彻底移除会暴露中国客户端定位的 Cloudflare 边缘指纹
+    // 6. 清洗标头：彻底剥离 CF、Vercel 及中国客户端特征
     const cleanHeaders = new Headers();
-    const hopByHopHeaders = new Set([
-      'cf-ray',
-      'cf-connecting-ip',
-      'cf-ipcountry',
-      'cf-visitor',
-      'cf-worker',
-      'cdn-loop',
-      'x-forwarded-for',
-      'x-forwarded-proto',
-      'x-real-ip',
-      'x-vercel-id',
-      'x-vercel-ip-country',
-      'x-vercel-ip-city',
-      'x-vercel-forwarded-for',
-      'host',
-      'content-length',
-      'connection',
-      'x-target-url',
-      'x-upstream-url',
-      'x-relay-source',
-    ]);
-
     for (const [key, value] of request.headers.entries()) {
-      if (!hopByHopHeaders.has(key.toLowerCase())) {
-        cleanHeaders.set(key, value);
+      const lower = key.toLowerCase();
+      if (
+        lower.startsWith('cf-') ||
+        lower.startsWith('x-vercel-') ||
+        lower.startsWith('sec-') ||
+        lower.includes('forwarded') ||
+        lower.includes('client-ip') ||
+        lower.includes('real-ip') ||
+        HOP_HEADERS.has(lower)
+      ) {
+        continue;
       }
+      cleanHeaders.set(key, value);
     }
 
-    // 设置正确的目标 Host（解决 TLS SNI 和服务商虚拟主机路由问题）
-    cleanHeaders.set('host', finalTargetUrl.hostname);
-
-    // 保障 User-Agent 合规
-    if (!cleanHeaders.has('user-agent')) {
+    // 保护 UA：确保不漏出 Cloudflare-Workers 标识
+    const currentUA = cleanHeaders.get('user-agent') || '';
+    if (!currentUA || currentUA.includes('Cloudflare') || currentUA.includes('Vercel')) {
       cleanHeaders.set('user-agent', 'OpenAI/Python 1.30.0');
     }
 
-    // 5. 向真实 AI 服务商发起出站请求
-    try {
-      const fetchOptions = {
-        method: request.method,
-        headers: cleanHeaders,
-        redirect: 'follow',
-      };
+    // 7. 发起出站请求
+    const fetchOptions = {
+      method,
+      headers: cleanHeaders,
+      redirect: 'manual', // 保持 manual，让 Worker 端统一处理重定向
+      signal: request.signal, // 与 Worker 端的 60s 超时严格联动，超时即终止上游计费
+    };
 
-      if (!['GET', 'HEAD'].includes(request.method.toUpperCase())) {
-        fetchOptions.body = request.body;
-        fetchOptions.duplex = 'half';
-      }
-
-      const upstreamResponse = await fetch(finalTargetUrl.toString(), fetchOptions);
-
-      // 6. 构造返回给 Worker 的响应
-      const responseHeaders = new Headers(upstreamResponse.headers);
-      responseHeaders.set('Access-Control-Allow-Origin', '*');
-      responseHeaders.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
-      responseHeaders.set('Access-Control-Allow-Headers', '*');
-
-      // 移除已失效的传输编码或长度头，交由运行时自动流式分块
-      responseHeaders.delete('content-encoding');
-      responseHeaders.delete('content-length');
-
-      return new Response(upstreamResponse.body, {
-        status: upstreamResponse.status,
-        statusText: upstreamResponse.statusText,
-        headers: responseHeaders,
-      });
-    } catch (err) {
-      console.error(`[Relay Error] 请求上游失败: ${err.message}`);
-      return new Response(
-        JSON.stringify({
-          error: {
-            message: `Vercel 中转请求失败: ${err.message}`,
-            type: 'relay_proxy_error',
-            target: finalTargetUrl ? finalTargetUrl.toString() : 'unknown',
-          },
-        }),
-        {
-          status: 502,
-          headers: {
-            'Content-Type': 'application/json',
-            'Access-Control-Allow-Origin': '*',
-          },
-        }
-      );
+    if (!['GET', 'HEAD'].includes(method) && request.body) {
+      fetchOptions.body = request.body;
+      fetchOptions.duplex = 'half';
     }
-  } catch (globalErr) {
-    console.error(`[Global Error] ${globalErr.message}`);
-    return new Response(
-      JSON.stringify({
-        error: {
-          message: `Vercel 函数执行异常: ${globalErr.message}`,
-          stack: globalErr.stack,
-        },
-      }),
-      {
-        status: 500,
-        headers: { 'Content-Type': 'application/json; charset=utf-8' },
+
+    let upstreamResponse;
+    try {
+      upstreamResponse = await fetch(finalTargetUrl.toString(), fetchOptions);
+    } catch (err) {
+      if (err.name === 'AbortError') {
+        return new Response('Client Aborted', { status: 499, headers: CORS_HEADERS });
       }
+      throw err;
+    }
+
+    // 8. 构造回传给 Worker 的响应
+    const responseHeaders = new Headers(upstreamResponse.headers);
+    for (const [k, v] of Object.entries(CORS_HEADERS)) {
+      responseHeaders.set(k, v);
+    }
+    
+    for (const h of RESPONSE_HOP_HEADERS) {
+      responseHeaders.delete(h);
+    }
+
+    // 禁用流式缓冲，保障打字机丝滑
+    const contentType = responseHeaders.get('content-type') || '';
+    if (contentType.includes('text/event-stream')) {
+      responseHeaders.set('Cache-Control', 'no-cache, no-transform');
+      responseHeaders.set('X-Accel-Buffering', 'no');
+    }
+
+    const responseBody = ([204, 304].includes(upstreamResponse.status) || method === 'HEAD')
+      ? null
+      : upstreamResponse.body;
+
+    return new Response(responseBody, {
+      status: upstreamResponse.status,
+      headers: responseHeaders,
+    });
+  } catch (err) {
+    console.error(`[Relay Error] ${err.message}`);
+    return jsonResponse(
+      {
+        error: {
+          message: `Vercel 中转网关执行异常: ${err.message}`,
+          type: 'relay_gateway_error',
+        },
+      },
+      502
     );
   }
 }
