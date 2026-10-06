@@ -1,24 +1,9 @@
 export const config = {
   runtime: 'edge',
-  regions: ['sfo1'], // 【极速优化】：改为美西旧金山机房！拥有原生美国原生公网 IP，同时比美东 iad1 减少 160ms+ 往返物理延迟
+  regions: ['sfo1'], // 【极速优化】：美西旧金山机房，原生美国公网 IP，极速物理延迟
 };
 
-const DEFAULT_UPSTREAM = (process.env.DEFAULT_UPSTREAM || 'https://api.openai.com').replace(/\/+$/, '');
-const PRIVATEMODE_UPSTREAM = (process.env.PRIVATEMODE_UPSTREAM || 'https://proxyless-api.privatemode.ai').replace(/\/+$/, '');
-const RELAY_SECRET = (process.env.RELAY_SECRET || '').trim();
-const PRIVATEMODE_API_KEY = (process.env.PRIVATEMODE_API_KEY || '').trim();
-const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || '').trim();
-
-// 内部转发时需要剔除的中转头
-const STRIP_HEADERS = [
-  'host',
-  'cdn-loop',
-  'x-target-url',
-  'x-upstream-url',
-  'x-relay-source',
-  'x-relay-secret',
-  'x-relay-provider',
-];
+// 环境变量在 handler 中动态获取，支持热更新与测试灵活注入
 
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
@@ -27,8 +12,53 @@ const CORS_HEADERS = {
   'Access-Control-Max-Age': '86400',
 };
 
+// 判断是否为需要剥离的特征标头（彻底抹除 Cloudflare、Vercel、Railway 边缘特征与客户端物理 IP）
+function shouldStripHeader(name) {
+  const lower = name.toLowerCase();
+  if (
+    lower === 'host' ||
+    lower === 'cdn-loop' ||
+    lower.startsWith('cf-') ||
+    lower.startsWith('x-vercel-') ||
+    lower.startsWith('x-railway-') ||
+    lower.startsWith('x-forwarded-') ||
+    lower === 'x-real-ip' ||
+    lower === 'true-client-ip' ||
+    lower.startsWith('x-relay-') ||
+    lower === 'x-target-url' ||
+    lower === 'x-upstream-url' ||
+    lower === 'connection' ||
+    lower === 'keep-alive' ||
+    lower === 'transfer-encoding'
+  ) {
+    return true;
+  }
+  return false;
+}
+
+// 智能拼接上游基地址与请求路径，避免双重 /v1/v1 等路径错误
+function buildUpstreamUrl(baseUrlStr, pathname, search = '') {
+  const cleanBase = baseUrlStr.trim().replace(/\/+$/, '');
+  let cleanPath = pathname;
+
+  // 若 base 已经带有 /v1 且请求路径也以 /v1 开头，剔除多余的 /v1
+  if (cleanBase.endsWith('/v1') && cleanPath.startsWith('/v1')) {
+    cleanPath = cleanPath.slice(3);
+  }
+  if (!cleanPath.startsWith('/')) {
+    cleanPath = '/' + cleanPath;
+  }
+  return `${cleanBase}${cleanPath}${search || ''}`;
+}
+
 export default async function handler(request) {
   try {
+    const DEFAULT_UPSTREAM = (process.env.DEFAULT_UPSTREAM || 'https://api.openai.com').replace(/\/+$/, '');
+    const PRIVATEMODE_UPSTREAM = (process.env.PRIVATEMODE_UPSTREAM || 'https://proxyless-api.privatemode.ai').replace(/\/+$/, '');
+    const RELAY_SECRET = (process.env.RELAY_SECRET || '').trim();
+    const PRIVATEMODE_API_KEY = (process.env.PRIVATEMODE_API_KEY || '').trim();
+    const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || '').trim();
+
     const method = request.method;
     const incomingUrl = new URL(request.url);
     const pathname = incomingUrl.pathname;
@@ -41,7 +71,7 @@ export default async function handler(request) {
       });
     }
 
-    // 2. 健康检查接口 (用于 Fly.io / 监控探针)
+    // 2. 健康检查接口 (用于 Railway / 监控探针)
     if (pathname === '/healthz' || pathname === '/health') {
       return new Response(
         JSON.stringify({
@@ -63,25 +93,10 @@ export default async function handler(request) {
     if (pathname === '/' && method === 'GET') {
       return new Response(
         JSON.stringify({
-          service: 'AI Relay Proxy Gateway',
+          service: 'Gateway',
           status: 'running',
           version: '1.0.0',
-          interfaces: {
-            privatemode: {
-              path: '/privatemode/v1/*',
-              target: PRIVATEMODE_UPSTREAM + '/v1/*',
-              description: 'Privatemode AI 端点 (支持 GLM-5.3, GLM-5.3-Flash, gpt-oss-120b 等)',
-            },
-            openai: {
-              path: '/v1/*',
-              target: DEFAULT_UPSTREAM + '/v1/*',
-              description: '默认 OpenAI 兼容端点',
-            },
-            custom: {
-              header: 'x-target-url: https://...',
-              description: 'OneAPI/CF Worker 自定义绝对目标 URL 转发',
-            },
-          },
+          interfaces: {},
         }, null, 2),
         {
           status: 200,
@@ -113,6 +128,11 @@ export default async function handler(request) {
       }
     }
 
+    // 从 Query 中清除 relay_secret，避免向上游泄露鉴权信息
+    if (incomingUrl.searchParams.has('relay_secret')) {
+      incomingUrl.searchParams.delete('relay_secret');
+    }
+
     // 5. 目标 URL 路由决策
     const targetUrlHeader = request.headers.get('x-target-url');
     const upstreamUrlHeader = request.headers.get('x-upstream-url');
@@ -122,7 +142,7 @@ export default async function handler(request) {
     let isPrivatemode = false;
 
     if (targetUrlHeader && targetUrlHeader.trim()) {
-      // A. 最高优先级：Worker 或客户端明确传入的完整绝对 URL
+      // A. 最高优先级：Cloudflare Worker 或客户端明确指定的绝对目标 URL
       finalTargetUrl = targetUrlHeader.trim();
       if (finalTargetUrl.includes('privatemode')) {
         isPrivatemode = true;
@@ -142,27 +162,42 @@ export default async function handler(request) {
       if (!subPath.startsWith('/')) {
         subPath = '/' + subPath;
       }
+      // 容错处理：若客户端直接请求 /privatemode/chat/completions（省略了 /v1），自动补齐 /v1
+      if (subPath !== '/' && !subPath.startsWith('/v1/') && subPath !== '/v1') {
+        subPath = '/v1' + subPath;
+      }
       finalTargetUrl = `${PRIVATEMODE_UPSTREAM}${subPath}${incomingUrl.search}`;
     } else if (upstreamUrlHeader && upstreamUrlHeader.trim()) {
-      // C. 基础 upstream 拼接
-      const base = upstreamUrlHeader.trim().replace(/\/+$/, '');
-      finalTargetUrl = `${base}${pathname}${incomingUrl.search}`;
+      // C. 动态 upstream 拼接（支持自定义基础端点，自动去除多余 /v1）
+      finalTargetUrl = buildUpstreamUrl(upstreamUrlHeader, pathname, incomingUrl.search);
+      if (finalTargetUrl.includes('privatemode')) {
+        isPrivatemode = true;
+      }
     } else {
       // D. 默认通用通道 (如直接调用 /v1/chat/completions)
-      finalTargetUrl = `${DEFAULT_UPSTREAM}${pathname}${incomingUrl.search}`;
+      finalTargetUrl = buildUpstreamUrl(DEFAULT_UPSTREAM, pathname, incomingUrl.search);
+      if (finalTargetUrl.includes('privatemode')) {
+        isPrivatemode = true;
+      }
     }
 
     // 6. Header 清洗与凭证自动填充
-    const headers = new Headers(request.headers);
-    for (const h of STRIP_HEADERS) {
-      headers.delete(h);
+    const headers = new Headers();
+    for (const [key, value] of request.headers.entries()) {
+      if (!shouldStripHeader(key)) {
+        headers.set(key, value);
+      }
     }
 
-    // Privatemode API Key 兜底注入
+    // Privatemode / OpenAI API Key 兜底注入
     if (isPrivatemode && PRIVATEMODE_API_KEY) {
       const currentAuth = headers.get('authorization') || '';
       if (!currentAuth || currentAuth === 'Bearer placeholder' || currentAuth === `Bearer ${RELAY_SECRET}`) {
         headers.set('authorization', `Bearer ${PRIVATEMODE_API_KEY}`);
+      }
+      const currentXKey = headers.get('x-api-key') || '';
+      if (currentXKey === 'placeholder' || (RELAY_SECRET && currentXKey === RELAY_SECRET)) {
+        headers.set('x-api-key', PRIVATEMODE_API_KEY);
       }
     } else if (!isPrivatemode && OPENAI_API_KEY) {
       const currentAuth = headers.get('authorization') || '';
@@ -171,12 +206,18 @@ export default async function handler(request) {
       }
     }
 
+    // 保护 User-Agent：若无 UA 或检测到 Cloudflare-Workers / Vercel 特征标识，清洗为官方标准标识
+    const currentUA = headers.get('user-agent') || '';
+    if (!currentUA || currentUA.includes('Cloudflare') || currentUA.includes('Vercel')) {
+      headers.set('user-agent', 'OpenAI/Python 1.30.0');
+    }
+
     // 设置目标域名 Host 并禁用客户端压缩缓冲，确保打字机单字即时流式推送
     try {
       const parsedTarget = new URL(finalTargetUrl);
       headers.set('host', parsedTarget.host);
     } catch {
-      // 如果不是合法的 URL 格式则保持原样
+      // 非合法 URL 格式保持原样
     }
     headers.set('accept-encoding', 'identity');
     headers.set('connection', 'keep-alive');
@@ -200,7 +241,7 @@ export default async function handler(request) {
       resHeaders.set(k, v);
     }
 
-    // 关键优化：彻底关闭下游缓冲，实现 0 延迟即时 Flush 流式输出
+    // 关键优化：彻底关闭下游（Cloudflare / 反向代理）缓冲，实现 0 延迟即时 Flush 流式输出
     resHeaders.set('Cache-Control', 'no-cache, no-transform');
     resHeaders.set('X-Accel-Buffering', 'no');
 
@@ -209,6 +250,9 @@ export default async function handler(request) {
       headers: resHeaders,
     });
   } catch (err) {
+    if (err.name === 'AbortError') {
+      return new Response(null, { status: 499, headers: CORS_HEADERS });
+    }
     return new Response(
       JSON.stringify({
         error: {

@@ -10,6 +10,13 @@ const server = http.createServer(async (req, res) => {
   req.socket.setKeepAlive(true);
   req.socket.setTimeout(0);
 
+  const abortController = new AbortController();
+  req.on('close', () => {
+    if (!res.writableEnded) {
+      abortController.abort();
+    }
+  });
+
   try {
     const protocol = req.headers['x-forwarded-proto'] || 'http';
     const host = req.headers['host'] || `localhost:${PORT}`;
@@ -34,6 +41,7 @@ const server = http.createServer(async (req, res) => {
       headers,
       body,
       duplex: hasBody ? 'half' : undefined,
+      signal: abortController.signal,
     });
 
     const webResponse = await handler(webRequest);
@@ -42,6 +50,8 @@ const server = http.createServer(async (req, res) => {
     for (const [key, value] of webResponse.headers.entries()) {
       res.setHeader(key, value);
     }
+    // 立即向客户端输出 HTTP 响应头，消除大模型思考阶段等待首字的连接假死假象
+    res.flushHeaders();
 
     if (webResponse.body) {
       const nodeReadable = Readable.fromWeb(webResponse.body);
@@ -49,6 +59,8 @@ const server = http.createServer(async (req, res) => {
         if (!res.headersSent) {
           res.statusCode = 502;
           res.end(JSON.stringify({ error: { message: `Stream error: ${err.message}` } }));
+        } else {
+          res.destroy(err);
         }
       });
       nodeReadable.pipe(res);
@@ -63,6 +75,11 @@ const server = http.createServer(async (req, res) => {
     }
   }
 });
+
+// 针对 Railway / 云端反向代理优化长连接及大模型长文本流式输出
+server.keepAliveTimeout = 65000;
+server.headersTimeout = 66000;
+server.requestTimeout = 0;
 
 server.listen(PORT, HOST, () => {
   console.log(`[Relay Server] Listening on http://${HOST}:${PORT}`);
