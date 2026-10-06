@@ -22,7 +22,7 @@ export default async function handler(request) {
   try {
     const method = request.method;
 
-    // 1. CORS 预检快速通道（仅针对浏览器 OPTIONS，正常请求不浪费多余 CORS 标头）
+    // 1. CORS 预检快速通道
     if (method === 'OPTIONS') {
       return new Response(null, {
         status: 204,
@@ -35,28 +35,35 @@ export default async function handler(request) {
       });
     }
 
-    // 2. Railway 健康检查探针（快速响应，防止容器探针超时重启）
+    // 2. Railway 健康检查探针（快速响应）
     const url = new URL(request.url);
     if (url.pathname === '/healthz' || url.pathname === '/health') {
       return new Response('ok', { status: 200 });
     }
 
-    // 3. 极简鉴权（速度优先：仅在配置了 RELAY_SECRET 时进行毫秒级等值校验）
-    if (RELAY_SECRET && request.headers.get('x-relay-secret') !== RELAY_SECRET) {
-      return new Response('Unauthorized', { status: 403 });
+    // 3. 网关安全防刷（若配置了 RELAY_SECRET，校验 Worker 的内部暗号头或 Bearer 密码）
+    if (RELAY_SECRET) {
+      const headerSecret = request.headers.get('x-relay-secret');
+      const authHeader = request.headers.get('authorization') || '';
+      const bearerSecret = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+
+      // Worker 会带 x-relay-secret；直连 privatemode 服务时可能会在 Bearer 里带密码
+      if (headerSecret !== RELAY_SECRET && bearerSecret !== RELAY_SECRET) {
+        return new Response('Unauthorized', { status: 403 });
+      }
     }
 
     // =========================================================================
-    // 【独立逻辑一】：Privatemode AI 专属中转逻辑（独立路径处理，与 CF 中转完全分离）
+    // 【业务逻辑一】：Privatemode 托管服务模式（固定服务端点，自动挂载服务端配置的秘钥）
     // =========================================================================
     if (url.pathname.startsWith('/privatemode') || url.pathname.startsWith('/pm')) {
       return await handlePrivatemode(request, url);
     }
 
     // =========================================================================
-    // 【独立逻辑二】：Cloudflare Worker 原生中转逻辑（保持你原来的极简原生逻辑 100% 不变）
+    // 【业务逻辑二】：/v1 纯中转透传模式（纯管道：接口地址透传 + 客户端 Auth 秘钥 100% 原样透传）
     // =========================================================================
-    return await handleCloudflareRelay(request);
+    return await handleCloudflareRelay(request, url);
 
   } catch (err) {
     return new Response(`Relay Error: ${err.message}`, { status: 502 });
@@ -64,23 +71,35 @@ export default async function handler(request) {
 }
 
 // -----------------------------------------------------------------------------
-// 逻辑二实现：Cloudflare Worker 原生中转（你的原版代码，一字未动，速度优先）
+// 逻辑二：/v1 纯中转模式（纯管道，地址和 Auth 秘钥 100% 原样透传给服务商）
 // -----------------------------------------------------------------------------
-async function handleCloudflareRelay(request) {
-  // 极速目标 URL 获取（直接使用 Worker 算好的绝对字符串，跳过 new URL 解析）
-  const targetUrl = request.headers.get('x-target-url') || DEFAULT_UPSTREAM;
+async function handleCloudflareRelay(request, url) {
+  // 1. 接口目标地址透传：
+  // Worker 传了 x-target-url 就直接按指定地址转发；没传就按标准 OpenAI 格式拼上原请求路径
+  let targetUrl = request.headers.get('x-target-url');
+  if (!targetUrl) {
+    const upstream = (request.headers.get('x-upstream-url') || DEFAULT_UPSTREAM).replace(/\/+$/, '');
+    targetUrl = `${upstream}${url.pathname}${url.search}`;
+  }
 
-  // 高效标头传递：直接复用，只删无用中转头
+  // 2. 标头透传：直接复用，只剔除内部中转头
+  // 客户端原本带过来的 Authorization: Bearer <真实模型Key> 原封不动 100% 保留透传！
   const headers = new Headers(request.headers);
   for (let i = 0; i < STRIP_HEADERS.length; i++) {
     headers.delete(STRIP_HEADERS[i]);
   }
 
-  // 【关键】：强制明文，彻底禁用上游 gzip 窗口缓冲，保持打字机单字实时推送
+  // 设置与目标地址一致的 Host
+  try {
+    const parsed = new URL(targetUrl);
+    headers.set('host', parsed.host);
+  } catch {}
+
+  // 强制明文，彻底禁用上游 gzip 窗口缓冲，保持打字机单字实时推送
   headers.set('accept-encoding', 'identity');
   headers.set('connection', 'keep-alive');
 
-  // 极速出站 fetch（原生管道，零额外包装）
+  // 3. 极速出站 fetch（纯透传）
   const upstreamResponse = await fetch(targetUrl, {
     method: request.method,
     headers,
@@ -90,14 +109,10 @@ async function handleCloudflareRelay(request) {
     duplex: 'half',
   });
 
-  // 构造回传响应：精简首部，强力注入防缓冲标头
+  // 4. 响应回传（防缓冲）
   const resHeaders = new Headers(upstreamResponse.headers);
-  
-  // 剔除干扰流式的 hop-by-hop 标头
   resHeaders.delete('content-length');
   resHeaders.delete('content-encoding');
-
-  // 无论任何流，强行关闭下游（Worker 及所有反代）的任何缓冲区，实现 0 延迟即时 Flush
   resHeaders.set('Cache-Control', 'no-cache, no-transform');
   resHeaders.set('X-Accel-Buffering', 'no');
 
@@ -108,10 +123,10 @@ async function handleCloudflareRelay(request) {
 }
 
 // -----------------------------------------------------------------------------
-// 逻辑一实现：Privatemode AI 专属中转（支持 /privatemode/v1/* 及 Key 注入）
+// 逻辑一：Privatemode 托管服务模式（固定服务，使用服务端配置的 PRIVATEMODE_API_KEY）
 // -----------------------------------------------------------------------------
 async function handlePrivatemode(request, url) {
-  // 1. 路径剥离：将 /privatemode/v1/* 或 /pm/v1/* 转换为上游端点
+  // 1. 路径映射：剥离 /privatemode 或 /pm 前缀，映射到官方 API
   let subPath = url.pathname.replace(/^\/(privatemode|pm)/, '');
   if (!subPath.startsWith('/')) subPath = '/' + subPath;
   if (subPath !== '/' && !subPath.startsWith('/v1')) {
@@ -125,15 +140,15 @@ async function handlePrivatemode(request, url) {
     headers.delete(STRIP_HEADERS[i]);
   }
 
-  // 3. 目标 Host 设置
   try {
     const parsed = new URL(targetUrl);
     headers.set('host', parsed.host);
   } catch {}
 
-  // 4. 若服务端配置了 PRIVATEMODE_API_KEY，自动为无 key 或占位符请求注入真实 key
+  // 3. Privatemode 专用秘钥注入：使用服务端配置的 PRIVATEMODE_API_KEY
   if (PRIVATEMODE_API_KEY) {
     const auth = headers.get('authorization') || '';
+    // 如果客户端没填、填了占位符、或是填的网关密码 RELAY_SECRET，统一注入服务端真正的 Privatemode Key
     if (!auth || auth === 'Bearer placeholder' || (RELAY_SECRET && auth === `Bearer ${RELAY_SECRET}`)) {
       headers.set('authorization', `Bearer ${PRIVATEMODE_API_KEY}`);
     }
@@ -142,7 +157,7 @@ async function handlePrivatemode(request, url) {
   headers.set('accept-encoding', 'identity');
   headers.set('connection', 'keep-alive');
 
-  // 5. 出站转发
+  // 4. 出站请求转发
   const upstreamResponse = await fetch(targetUrl, {
     method: request.method,
     headers,
@@ -152,11 +167,10 @@ async function handlePrivatemode(request, url) {
     duplex: 'half',
   });
 
-  // 6. 流式响应防缓冲
+  // 5. 响应回传
   const resHeaders = new Headers(upstreamResponse.headers);
   resHeaders.delete('content-length');
   resHeaders.delete('content-encoding');
-
   resHeaders.set('Cache-Control', 'no-cache, no-transform');
   resHeaders.set('X-Accel-Buffering', 'no');
 
