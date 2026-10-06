@@ -41,27 +41,15 @@ export default async function handler(request) {
       return new Response('ok', { status: 200 });
     }
 
-    // 3. 网关安全防刷（若配置了 RELAY_SECRET，校验 Worker 的内部暗号头或 Bearer 密码）
-    if (RELAY_SECRET) {
-      const headerSecret = request.headers.get('x-relay-secret');
-      const authHeader = request.headers.get('authorization') || '';
-      const bearerSecret = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
-
-      // Worker 会带 x-relay-secret；直连 privatemode 服务时可能会在 Bearer 里带密码
-      if (headerSecret !== RELAY_SECRET && bearerSecret !== RELAY_SECRET) {
-        return new Response('Unauthorized', { status: 403 });
-      }
-    }
-
     // =========================================================================
-    // 【业务逻辑一】：Privatemode 托管服务模式（固定服务端点，自动挂载服务端配置的秘钥）
+    // 【业务逻辑一】：Privatemode 托管服务模式（仅此服务需校验 RELAY_SECRET 保护自身 Key）
     // =========================================================================
     if (url.pathname.startsWith('/privatemode') || url.pathname.startsWith('/pm')) {
       return await handlePrivatemode(request, url);
     }
 
     // =========================================================================
-    // 【业务逻辑二】：/v1 纯中转透传模式（纯管道：接口地址透传 + 客户端 Auth 秘钥 100% 原样透传）
+    // 【业务逻辑二】：/v1 纯中转透传模式（纯管道：无需校验 RELAY_SECRET，地址与 Auth 100% 原样透传）
     // =========================================================================
     return await handleCloudflareRelay(request, url);
 
@@ -126,7 +114,18 @@ async function handleCloudflareRelay(request, url) {
 // 逻辑一：Privatemode 托管服务模式（固定服务，使用服务端配置的 PRIVATEMODE_API_KEY）
 // -----------------------------------------------------------------------------
 async function handlePrivatemode(request, url) {
-  // 1. 路径映射：剥离 /privatemode 或 /pm 前缀，映射到官方 API
+  // 1. 专属鉴权（仅针对 Privatemode 保护服务端 Key，防止外部盗刷）
+  if (RELAY_SECRET) {
+    const headerSecret = request.headers.get('x-relay-secret');
+    const authHeader = request.headers.get('authorization') || '';
+    const bearerSecret = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+
+    if (headerSecret !== RELAY_SECRET && bearerSecret !== RELAY_SECRET) {
+      return new Response('Unauthorized', { status: 403 });
+    }
+  }
+
+  // 2. 路径映射：剥离 /privatemode 或 /pm 前缀，映射到官方 API
   let subPath = url.pathname.replace(/^\/(privatemode|pm)/, '');
   if (!subPath.startsWith('/')) subPath = '/' + subPath;
   if (subPath !== '/' && !subPath.startsWith('/v1')) {
