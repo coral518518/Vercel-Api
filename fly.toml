@@ -1,0 +1,36 @@
+# Fly.io 配置文件：AI Relay 网关中转 (同时支持 OpenAI 和 Privatemode)
+# 部署命令: fly launch 或 fly deploy
+
+app = "privatemode-relay-api"
+primary_region = "sjc"
+
+[build]
+
+[env]
+  PORT = "8080"
+  HOST = "0.0.0.0"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ["app"]
+
+  [http_service.concurrency]
+    type = "requests"
+    hard_limit = 300
+    soft_limit = 200
+
+[[http_service.checks]]
+  grace_period = "10s"
+  interval = "30s"
+  method = "GET"
+  path = "/healthz"
+  timeout = "5s"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory = "512mb"

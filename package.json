@@ -1,9 +1,15 @@
 {
-  "name": "vercel-oneapi-relay",
-  "version": "1.0.0",
-  "description": "Universal Relay Proxy for OneAPI on Cloudflare Workers",
+  "name": "privatemode-relay-gateway",
+  "version": "1.1.0",
+  "description": "Universal Relay Proxy for OneAPI & Privatemode AI on Vercel & Fly.io",
+  "type": "module",
   "private": true,
+  "main": "server.js",
   "scripts": {
+    "start": "node server.js",
     "dev": "vercel dev"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
