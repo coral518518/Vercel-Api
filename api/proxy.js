@@ -12,6 +12,9 @@ const PRIVATEMODE_API_KEY = (process.env.PRIVATEMODE_API_KEY || '').trim();
 const STRIP_HEADERS = [
   'host',
   'cdn-loop',
+  'transfer-encoding',
+  'connection',
+  'keep-alive',
   'x-target-url',
   'x-upstream-url',
   'x-relay-source',
@@ -54,7 +57,7 @@ export default async function handler(request) {
     return await handleCloudflareRelay(request, url);
 
   } catch (err) {
-    return new Response(`Relay Error: ${err.message}`, { status: 502 });
+    return new Response(`Relay Error: ${err.message} (${err.cause?.message || err.cause || ''})`, { status: 502 });
   }
 }
 

@@ -10,9 +10,9 @@ const server = http.createServer(async (req, res) => {
   req.socket.setKeepAlive(true);
   req.socket.setTimeout(0);
 
-  // 客户端中断信号监听
+  // 客户端中断信号监听（必须监听 res 的 close，监听 req 的 close 会在请求体读取完毕时误触发中断）
   const abortController = new AbortController();
-  req.on('close', () => {
+  res.on('close', () => {
     if (!res.writableEnded) {
       abortController.abort();
     }
