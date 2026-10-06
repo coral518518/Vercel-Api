@@ -81,7 +81,7 @@ async function handleCloudflareRelay(request, url) {
   try {
     const parsed = new URL(targetUrl);
     headers.set('host', parsed.host);
-  } catch {}
+  } catch { }
 
   // 强制明文，彻底禁用上游 gzip 窗口缓冲，保持打字机单字实时推送
   headers.set('accept-encoding', 'identity');
@@ -142,7 +142,7 @@ async function handlePrivatemode(request, url) {
   try {
     const parsed = new URL(targetUrl);
     headers.set('host', parsed.host);
-  } catch {}
+  } catch { }
 
   // 3. Privatemode 专用秘钥注入：使用服务端配置的 PRIVATEMODE_API_KEY
   if (PRIVATEMODE_API_KEY) {

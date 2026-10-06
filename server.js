@@ -10,13 +10,6 @@ const server = http.createServer(async (req, res) => {
   req.socket.setKeepAlive(true);
   req.socket.setTimeout(0);
 
-  const abortController = new AbortController();
-  req.on('close', () => {
-    if (!res.writableEnded) {
-      abortController.abort();
-    }
-  });
-
   try {
     const protocol = req.headers['x-forwarded-proto'] || 'http';
     const host = req.headers['host'] || `localhost:${PORT}`;
@@ -41,7 +34,6 @@ const server = http.createServer(async (req, res) => {
       headers,
       body,
       duplex: hasBody ? 'half' : undefined,
-      signal: abortController.signal,
     });
 
     const webResponse = await handler(webRequest);
@@ -50,8 +42,6 @@ const server = http.createServer(async (req, res) => {
     for (const [key, value] of webResponse.headers.entries()) {
       res.setHeader(key, value);
     }
-    // 立即向客户端输出 HTTP 响应头，消除大模型思考阶段等待首字的连接假死假象
-    res.flushHeaders();
 
     if (webResponse.body) {
       const nodeReadable = Readable.fromWeb(webResponse.body);
