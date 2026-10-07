@@ -182,8 +182,64 @@ async function saveStoredToken(tokenData) {
     await fs.writeFile(tokenFile, JSON.stringify(tokenData, null, 2), 'utf8');
   } catch { }
 
-  // 2. 远程 D1 KV 同步（读取后追加并提交写入 kvadd）
-  await syncTokenToRemoteKv(tokenData);
+  // 2. 远程 D1 KV 同步（非阻塞异步写入，避免外部接口网络抖动卡死前端响应）
+  syncTokenToRemoteKv(tokenData).catch(err => {
+    console.warn('[Remote KV] 异步写入失败:', err.message);
+  });
+}
+
+// -----------------------------------------------------------------------------
+// 服务端后台全自动监听轮询（解耦客户端浏览器休眠与网络挂起）
+// -----------------------------------------------------------------------------
+const activePollSessions = new Set();
+
+function startServerSidePolling(session) {
+  if (!session || activePollSessions.has(session)) return;
+  activePollSessions.add(session);
+
+  let attempts = 0;
+  const maxAttempts = 120; // 轮询最多 6 分钟 (每 3 秒一次)
+  const timer = setInterval(async () => {
+    attempts++;
+    if (attempts > maxAttempts || !activePollSessions.has(session)) {
+      clearInterval(timer);
+      activePollSessions.delete(session);
+      return;
+    }
+
+    try {
+      const res = await fetch(`${CLIXAD_UPSTREAM}/v1/auth/device/poll`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (data.token || data.status === 'complete') {
+        clearInterval(timer);
+        activePollSessions.delete(session);
+        console.log('[Clixad] 服务端后台捕获到 GitHub 授权 Token:', data.login || data.email || 'user');
+        await saveStoredToken({
+          token: data.token,
+          userId: data.userId,
+          email: data.email,
+          login: data.login,
+          balance: data.balance,
+          created: data.created,
+          created_at: Date.now()
+        });
+        fetch(`${CLIXAD_UPSTREAM}/v1/streak/claim`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${data.token}`
+          }
+        }).catch(() => {});
+      } else if (data.status === 'closed' || data.status === 'expired') {
+        clearInterval(timer);
+        activePollSessions.delete(session);
+      }
+    } catch { }
+  }, 3000);
 }
 
 // 仅保留 Worker 专用的内部路由头剔除名单
@@ -392,6 +448,9 @@ async function handleClixad(request, url) {
   if (normPath === '/clixad/auth/poll' || normPath === '/cx/auth/poll') {
     return await handleClixadAuthPoll(request, url);
   }
+  if (normPath === '/clixad/token' || normPath === '/cx/token') {
+    return await handleClixadSaveToken(request, url);
+  }
   if (normPath === '/clixad/status' || normPath === '/cx/status') {
     return await handleClixadStatus(request, url);
   }
@@ -538,6 +597,11 @@ async function handleClixadAuthStart(request, url) {
     }
     const data = await res.json();
 
+    // 启动服务端独立后台轮询（解耦客户端浏览器休眠）
+    if (data.session) {
+      startServerSidePolling(data.session);
+    }
+
     if (GITHUB_COOKIE && data.user_code) {
       autoApproveGitHubDevice(data.user_code, GITHUB_COOKIE).catch(() => {});
     }
@@ -556,6 +620,19 @@ async function handleClixadAuthPoll(request, url) {
   if (!session) {
     return new Response(JSON.stringify({ error: 'Missing session parameter' }), { status: 400 });
   }
+
+  // 1. 如果服务端已由后台轮询或手动配置捕获到 Token，直接极速返回成功！
+  if (hostedToken) {
+    return new Response(JSON.stringify({
+      status: 'complete',
+      token: hostedToken,
+      ...hostedAccount
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+
   try {
     const res = await fetch(`${CLIXAD_UPSTREAM}/v1/auth/device/poll`, {
       method: 'POST',
@@ -563,7 +640,7 @@ async function handleClixadAuthPoll(request, url) {
       body: JSON.stringify({ session })
     });
     const data = await res.json().catch(() => ({}));
-    if (data.status === 'complete' && data.token) {
+    if (data.token || data.status === 'complete') {
       await saveStoredToken({
         token: data.token,
         userId: data.userId,
@@ -587,6 +664,44 @@ async function handleClixadAuthPoll(request, url) {
     });
   } catch (err) {
     return new Response(JSON.stringify({ error: err.message }), { status: 502 });
+  }
+}
+
+async function handleClixadSaveToken(request, url) {
+  try {
+    let body = {};
+    try {
+      body = await request.json();
+    } catch {
+      const text = await request.text();
+      body = { token: text.trim() };
+    }
+    const token = (body.token || '').trim();
+    if (!token) {
+      return new Response(JSON.stringify({ error: 'Token 不能为空' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    let account = { token, login: '手动绑定账号', created_at: Date.now() };
+    try {
+      const wRes = await fetch(`${CLIXAD_UPSTREAM}/v1/wallet?premium=1`, {
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      if (wRes.ok) {
+        const wData = await wRes.json();
+        if (wData.balance !== undefined) account.balance = wData.balance;
+      }
+    } catch { }
+
+    await saveStoredToken(account);
+    return new Response(JSON.stringify({ success: true, message: 'Token 已成功绑定并同步至 D1 KV', account }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  } catch (err) {
+    return new Response(JSON.stringify({ error: err.message }), { status: 500 });
   }
 }
 
@@ -774,7 +889,7 @@ function renderLoginPage({ activeToken, account, origin }) {
     bodyContent = `
       <div class="badge badge-pending">● 免终端一键授权流程</div>
       <h1 class="title">Clixad 云端一键免终端认证</h1>
-      <p class="subtitle">无需在电脑上安装 Node.js 或运行 <code style="color:#a5b4fc">npm install -g clixad</code>。点击下方按钮即可一键在 GitHub 完成授权，云端自动捕获并持久化密钥！</p>
+      <p class="subtitle">无需在电脑上安装 Node.js 或运行 <code style="color:#a5b4fc">npm install -g clixad</code>。点击下方按钮即可在 GitHub 完成授权，云端自动捕获并持久化密钥！</p>
 
       <div class="code-box">
         <div style="font-size: 12px; color: #94a3b8; margin-bottom: 6px;">你的 GitHub 设备授权码</div>
@@ -783,7 +898,7 @@ function renderLoginPage({ activeToken, account, origin }) {
 
       <div class="btn-group">
         <button id="copyBtn" class="btn btn-secondary" onclick="copyCode()">📋 复制授权码</button>
-        <a id="authLink" href="#" target="_blank" class="btn btn-primary">🚀 前往 GitHub 授权</a>
+        <a id="authLink" href="https://github.com/login/device" target="_blank" class="btn btn-primary">🚀 前往 GitHub 授权</a>
       </div>
 
       <div class="status-text" id="statusBox">
@@ -792,24 +907,58 @@ function renderLoginPage({ activeToken, account, origin }) {
       </div>
 
       <div class="tips">
-        💡 <strong>操作步骤</strong>：点击“前往 GitHub 授权”，在打开的页面中粘贴授权码并点击“Authorize”；授权完毕后返回本页面，系统将自动激活并开始服务！
+        💡 <strong>操作步骤</strong>：点击“前往 GitHub 授权”，在打开的页面中粘贴上方授权码并确认；确认后返回本页面，系统将自动激活并开始服务！
+      </div>
+
+      <!-- 备选直接绑定通道：零障碍容灾 -->
+      <div style="margin-top: 24px; padding-top: 20px; border-top: 1px solid #1f2937;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+          <span style="font-size: 13px; font-weight: 600; color: #cbd5e1;">备选方案：直接粘贴 Token 绑定</span>
+          <button onclick="resetAuthCode()" style="background:none; border:none; color:#818cf8; font-size:12px; cursor:pointer; text-decoration:underline;">🔄 更换授权码</button>
+        </div>
+        <div style="display: flex; gap: 8px;">
+          <input type="text" id="manualToken" placeholder="粘贴你的 Clixad Token" style="flex:1; background:#1e293b; border:1px solid #334155; border-radius:8px; padding:10px 14px; color:#f1f5f9; font-size:14px; font-family:monospace; outline:none;" />
+          <button class="btn btn-secondary" onclick="saveManualToken()" style="flex:none; padding:10px 16px;">💾 保存绑定</button>
+        </div>
+        <div id="manualMsg" style="font-size:12px; margin-top:6px; color:#64748b;"></div>
       </div>
 
       <script>
         let currentCode = '';
         let session = '';
+        let pollCount = 0;
+        let isPolling = false;
 
         async function initAuth() {
+          // 优先使用 sessionStorage 中尚未过期的会话，防止用户切标签或刷新导致授权码变化
+          const savedSession = sessionStorage.getItem('clixad_auth_session');
+          const savedCode = sessionStorage.getItem('clixad_auth_code');
+          const savedTime = parseInt(sessionStorage.getItem('clixad_auth_time') || '0', 10);
+          
+          if (savedSession && savedCode && (Date.now() - savedTime < 12 * 60 * 1000)) {
+            session = savedSession;
+            currentCode = savedCode;
+            document.getElementById('userCode').innerText = currentCode;
+            document.getElementById('authLink').href = 'https://github.com/login/device';
+            document.getElementById('statusMsg').innerText = '正在持续监听 GitHub 授权结果...';
+            startPolling();
+            return;
+          }
+
           try {
-            const res = await fetch('${origin}/clixad/auth/start');
+            const res = await fetch('/clixad/auth/start');
             const data = await res.json();
             if (data.user_code && data.session) {
               currentCode = data.user_code;
               session = data.session;
+              sessionStorage.setItem('clixad_auth_session', session);
+              sessionStorage.setItem('clixad_auth_code', currentCode);
+              sessionStorage.setItem('clixad_auth_time', Date.now().toString());
+
               document.getElementById('userCode').innerText = currentCode;
               document.getElementById('authLink').href = data.verification_uri || 'https://github.com/login/device';
-              document.getElementById('statusMsg').innerText = '请在 GitHub 页面点击确认授权 (云端正在实时轮询中...)';
-              pollStatus();
+              document.getElementById('statusMsg').innerText = '请在 GitHub 页面点击确认授权 (云端与浏览器实时双重轮询中...)';
+              startPolling();
             } else {
               document.getElementById('statusMsg').innerText = '获取授权码失败: ' + (data.error || '未知错误');
             }
@@ -818,19 +967,58 @@ function renderLoginPage({ activeToken, account, origin }) {
           }
         }
 
-        async function pollStatus() {
-          if (!session) return;
+        function resetAuthCode() {
+          sessionStorage.clear();
+          location.reload();
+        }
+
+        function startPolling() {
+          if (isPolling) return;
+          isPolling = true;
+          pollCycle();
+        }
+
+        async function pollCycle() {
+          if (!session) { isPolling = false; return; }
+          pollCount++;
           try {
-            const res = await fetch('${origin}/clixad/auth/poll?session=' + encodeURIComponent(session));
+            const res = await fetch('/clixad/auth/poll?session=' + encodeURIComponent(session));
             const data = await res.json();
-            if (data.status === 'complete') {
-              document.getElementById('statusBox').innerHTML = '✅ <span style="color:#34d399;font-weight:600;">授权成功！云端已成功捕获密钥并激活，正在刷新...</span>';
-              setTimeout(() => { location.href = '${origin}/clixad/login'; }, 1500);
+            if (data.status === 'complete' || data.token) {
+              sessionStorage.removeItem('clixad_auth_session');
+              sessionStorage.removeItem('clixad_auth_code');
+              sessionStorage.removeItem('clixad_auth_time');
+              document.getElementById('statusBox').innerHTML = '✅ <span style="color:#34d399;font-weight:600;">授权成功！已成功捕获密钥并持久化，正在进入托管主页...</span>';
+              setTimeout(() => { location.href = '/clixad/login'; }, 1000);
               return;
             }
-          } catch {}
-          setTimeout(pollStatus, 2500);
+            if (data.status === 'closed') {
+              document.getElementById('statusMsg').innerText = '该授权码已关闭或注册已达上限: ' + (data.message || '');
+              isPolling = false;
+              return;
+            }
+            if (data.status === 'expired') {
+              sessionStorage.clear();
+              document.getElementById('statusMsg').innerText = '授权码已过期，请点击右上角更换授权码。';
+              isPolling = false;
+              return;
+            }
+            document.getElementById('statusMsg').innerText = '等待 GitHub 授权确认中 (已轮询 ' + pollCount + ' 次)...';
+          } catch (e) {
+            document.getElementById('statusMsg').innerText = '轮询重试中...';
+          }
+          setTimeout(pollCycle, 2500);
         }
+
+        // 当用户从 GitHub 标签页切换回本页时，立刻主动触发一次检查
+        document.addEventListener('visibilitychange', () => {
+          if (!document.hidden && session) {
+            pollCycle();
+          }
+        });
+        window.addEventListener('focus', () => {
+          if (session) pollCycle();
+        });
 
         function copyCode() {
           if (!currentCode) return;
@@ -839,6 +1027,38 @@ function renderLoginPage({ activeToken, account, origin }) {
             btn.innerText = '✅ 已复制!';
             setTimeout(() => { btn.innerText = '📋 复制授权码'; }, 2000);
           });
+        }
+
+        async function saveManualToken() {
+          const input = document.getElementById('manualToken');
+          const msg = document.getElementById('manualMsg');
+          const token = input.value.trim();
+          if (!token) {
+            msg.innerText = '⚠️ 请先输入有效 Token';
+            msg.style.color = '#f87171';
+            return;
+          }
+          msg.innerText = '正在验证并持久化同步至 D1 KV...';
+          msg.style.color = '#818cf8';
+          try {
+            const res = await fetch('/clixad/token', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ token })
+            });
+            const data = await res.json();
+            if (res.ok && data.success) {
+              msg.innerText = '✅ 保存成功！正在跳转...';
+              msg.style.color = '#34d399';
+              setTimeout(() => { location.href = '/clixad/login'; }, 1000);
+            } else {
+              msg.innerText = '保存失败: ' + (data.error || '未知错误');
+              msg.style.color = '#f87171';
+            }
+          } catch (e) {
+            msg.innerText = '提交失败: ' + e.message;
+            msg.style.color = '#f87171';
+          }
         }
 
         initAuth();
