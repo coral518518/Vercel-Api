@@ -20,7 +20,9 @@ Privatemode 提供了机密计算（Confidential Computing）环境下的安全 
 | **Privatemode 专用接口** | `/privatemode/v1/*` 或 `/pm/v1/*` | `https://proxyless-api.privatemode.ai/v1/*` | 自动剥离前缀并转发至 Privatemode |
 | **Clixad 专用接口** | `/clixad/v1/*` 或 `/cx/v1/*` | `https://clixad.onrender.com/v1/*` | 自动剥离前缀并转发至 Clixad (每日免费模型 + 进阶模型) |
 | **OpenAI 兼容通用接口** | `/v1/*` | `https://api.openai.com/v1/*` | 默认通用中转接口（可配置默认上游） |
-| **自定义目标接口** | 任意路径（带 `x-target-url` 请求头） | 请求头指定的完整绝对 URL | 兼容 Cloudflare Worker / OneAPI 动态路由 |
+| **自定义目标接口 (Query)** | `/?url=https://target.com/v1/chat/completions` | 参数指定的绝对 URL | 极简动态中转，支持各种模型接口透传 |
+| **自定义目标接口 (Header)** | 任意路径（带 `x-target-url` 请求头） | 请求头指定的完整绝对 URL | 兼容 Cloudflare Worker / OneAPI 动态路由 |
+| **标头诊断探针** | `/debug/headers` | 本地返回入站与清洗后 Headers | 用于测试 Workers 请求头剥离效果 |
 | **健康探针** | `/healthz` | 本地返回 `{ "status": "ok" }` | 供 Railway 健康检查与保活探测 |
 
 ---

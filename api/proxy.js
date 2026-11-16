@@ -242,18 +242,162 @@ function startServerSidePolling(session) {
   }, 3000);
 }
 
-// 仅保留 Worker 专用的内部路由头剔除名单
-const STRIP_HEADERS = [
+// =============================================================================
+// 请求头清洗与伪装配置：彻底剔除 Cloudflare、Vercel 等代理特征头，还原真实客户端
+// =============================================================================
+
+// 需精确剔除的代理或逐跳传输标头（全小写）
+const EXACT_STRIP_HEADERS = new Set([
   'host',
   'cdn-loop',
-  'transfer-encoding',
+  'x-real-ip',
+  'via',
+  'forwarded',
   'connection',
   'keep-alive',
+  'transfer-encoding',
+  'te',
+  'trailer',
+  'upgrade',
+  'proxy-connection',
+  'proxy-authenticate',
+  'proxy-authorization',
   'x-target-url',
   'x-upstream-url',
   'x-relay-source',
   'x-relay-secret',
+  'x-debug-headers',
+]);
+
+// 需前缀匹配剔除的特征标头（全小写前缀）
+const PREFIX_STRIP_HEADERS = [
+  'cf-',          // 彻底清除所有 Cloudflare 边缘及 Worker 注入头：cf-ray, cf-worker, cf-connecting-ip, cf-ipcountry, cf-visitor 等
+  'x-vercel-',    // 彻底清除所有 Vercel 注入头：x-vercel-id, x-vercel-forwarded-for, x-vercel-ip-* 等
+  'x-forwarded-', // 彻底清除所有代理转发头：x-forwarded-for, x-forwarded-proto, x-forwarded-host 等
 ];
+
+// 高拟真桌面端 User-Agent（当调用方未传 UA 或带有明显 Worker/fetch 特征时自动补齐）
+const DEFAULT_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
+
+// 调试模式开关（可通过环境变量 DEBUG_HEADERS=1 开启）
+const DEBUG_HEADERS = process.env.DEBUG_HEADERS === '1' || process.env.DEBUG_HEADERS === 'true';
+
+/**
+ * 清洗并伪装出站请求头：彻底剔除 Cloudflare 与 Vercel 代理痕迹，使其如真实客户端直接请求
+ */
+function cleanAndNormalizeHeaders(rawHeaders, targetUrl) {
+  const headers = new Headers();
+
+  for (const [key, value] of rawHeaders.entries()) {
+    const lowerKey = key.toLowerCase();
+
+    // 1. 过滤精确匹配名单 (逐跳传输头、内部私有路由头等)
+    if (EXACT_STRIP_HEADERS.has(lowerKey)) {
+      continue;
+    }
+
+    // 2. 过滤前缀特征名单 (cf-*, x-vercel-*, x-forwarded-*)
+    if (PREFIX_STRIP_HEADERS.some(prefix => lowerKey.startsWith(prefix))) {
+      continue;
+    }
+
+    headers.set(key, value);
+  }
+
+  // 3. 将 Host 重置为目标上游的 Host
+  try {
+    const parsed = new URL(targetUrl);
+    headers.set('host', parsed.host);
+  } catch { }
+
+  // 4. 优化 Accept-Encoding 与 Connection，防缓冲保证 SSE 打字机流式单字推送
+  headers.set('accept-encoding', 'identity');
+  headers.set('connection', 'keep-alive');
+
+  // 5. 伪装 User-Agent：若无 UA 或包含明显 Worker / 脚本特征，填充高拟真 Chrome UA
+  const currentUa = headers.get('user-agent') || '';
+  if (!currentUa || /cloudflare|worker|undici|node-fetch/i.test(currentUa)) {
+    headers.set('user-agent', DEFAULT_USER_AGENT);
+  }
+
+  return headers;
+}
+
+/**
+ * 校验目标 URL 是否合法且非内部私有地址（防御 SSRF 探测内网）
+ */
+function isValidTargetUrl(rawUrl) {
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return false;
+    }
+    const hostname = parsed.hostname.toLowerCase();
+    if (
+      hostname === 'localhost' ||
+      hostname === '127.0.0.1' ||
+      hostname === '0.0.0.0' ||
+      hostname === '::1' ||
+      hostname === '[::1]' ||
+      hostname === '169.254.169.254' ||
+      hostname.startsWith('127.') ||
+      hostname.startsWith('169.254.') ||
+      hostname.startsWith('10.') ||
+      hostname.startsWith('192.168.') ||
+      /^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(hostname)
+    ) {
+      return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 智能解析目标 URL：优先 ?url= 参数，其次 x-target-url 请求头，兜底拼接 upstream 路径
+ */
+function resolveTargetUrl(request, url, defaultUpstream = DEFAULT_UPSTREAM) {
+  let targetUrl = '';
+
+  // 1. 优先提取 ?url= 查询参数
+  if (url.searchParams.has('url')) {
+    targetUrl = url.searchParams.get('url') || '';
+  }
+
+  // 2. 其次提取 x-target-url 请求头
+  if (!targetUrl) {
+    targetUrl = request.headers.get('x-target-url') || '';
+  }
+
+  // 3. 若指定了目标地址（来自 ?url= 或 x-target-url）
+  if (targetUrl) {
+    targetUrl = targetUrl.trim();
+    // 自动补齐 https 协议
+    if (!/^https?:\/\//i.test(targetUrl)) {
+      targetUrl = 'https://' + targetUrl;
+    }
+
+    try {
+      const parsedTarget = new URL(targetUrl);
+      // 智能容错：若传入的是根域名（如 ?url=https://api.openai.com），而请求带有具体 path（如 /v1/chat/completions）
+      if (
+        (parsedTarget.pathname === '/' || parsedTarget.pathname === '') &&
+        url.pathname !== '/' &&
+        url.pathname !== '/api/proxy'
+      ) {
+        parsedTarget.pathname = url.pathname;
+        targetUrl = parsedTarget.toString();
+      }
+    } catch { }
+
+    return targetUrl;
+  }
+
+  // 4. 默认兜底：使用 x-upstream-url 或 defaultUpstream 拼接路径与参数
+  const upstream = (request.headers.get('x-upstream-url') || defaultUpstream).replace(/\/+$/, '');
+  return `${upstream}${url.pathname}${url.search}`;
+}
 
 export default async function handler(request) {
   try {
@@ -278,6 +422,24 @@ export default async function handler(request) {
       return new Response('ok', { status: 200 });
     }
 
+    // 3. 标头诊断探针（用于排查 Cloudflare / Vercel 真实自带标头及清洗效果）
+    if (url.pathname === '/debug/headers') {
+      return new Response(JSON.stringify({
+        message: 'Cloudflare / Vercel 请求头诊断探针',
+        raw_incoming_headers: Object.fromEntries(request.headers.entries()),
+        cleaned_outgoing_headers: Object.fromEntries(cleanAndNormalizeHeaders(request.headers, 'https://api.openai.com').entries()),
+        client_ip: request.headers.get('cf-connecting-ip') || request.headers.get('x-real-ip') || request.headers.get('x-forwarded-for') || 'unknown',
+        method: request.method,
+        url: request.url,
+      }, null, 2), {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Access-Control-Allow-Origin': '*'
+        }
+      });
+    }
+
     // =========================================================================
     // 【业务逻辑一】：Privatemode 托管服务模式（仅此服务需校验 RELAY_SECRET 保护自身 Key）
     // =========================================================================
@@ -297,7 +459,7 @@ export default async function handler(request) {
     }
 
     // =========================================================================
-    // 【业务逻辑三】：/v1 纯中转透传模式（纯管道：无需校验 RELAY_SECRET，地址与 Auth 100% 原样透传）
+    // 【业务逻辑三】：通用纯中转透传模式（支持 ?url=、x-target-url，纯管道：地址与 Auth 原样透传）
     // =========================================================================
     return await handleCloudflareRelay(request, url);
 
@@ -307,33 +469,35 @@ export default async function handler(request) {
 }
 
 // -----------------------------------------------------------------------------
-// 逻辑二：/v1 纯中转模式（纯管道，地址和 Auth 秘钥 100% 原样透传给服务商）
+// 逻辑二：通用纯中转模式（纯管道，支持 ?url= 参数和 x-target-url 请求头）
 // -----------------------------------------------------------------------------
 async function handleCloudflareRelay(request, url) {
-  // 1. 接口目标地址透传：
-  // Worker 传了 x-target-url 就直接按指定地址转发；没传就按标准 OpenAI 格式拼上原请求路径
-  let targetUrl = request.headers.get('x-target-url');
-  if (!targetUrl) {
-    const upstream = (request.headers.get('x-upstream-url') || DEFAULT_UPSTREAM).replace(/\/+$/, '');
-    targetUrl = `${upstream}${url.pathname}${url.search}`;
+  // 1. 接口目标地址解析（优先提取 ?url= 查询参数，其次 x-target-url 头，兜底拼 upstream）
+  const targetUrl = resolveTargetUrl(request, url, DEFAULT_UPSTREAM);
+
+  // 防御 SSRF 探测内网或非法协议
+  if (!isValidTargetUrl(targetUrl)) {
+    return new Response(JSON.stringify({
+      error: {
+        message: `非法或受限制的目标 URL: ${targetUrl}。禁止访问内网或非 HTTP(S) 地址。`,
+        type: 'invalid_target_url'
+      }
+    }), {
+      status: 400,
+      headers: { 'Content-Type': 'application/json; charset=utf-8' }
+    });
   }
 
-  // 2. 标头透传：直接复用，只剔除内部中转头
+  // 2. 标头清洗与伪装：彻底剔除 Cloudflare (cf-*)、Vercel (x-vercel-*) 等代理特征头
   // 客户端原本带过来的 Authorization: Bearer <真实模型Key> 原封不动 100% 保留透传！
-  const headers = new Headers(request.headers);
-  for (let i = 0; i < STRIP_HEADERS.length; i++) {
-    headers.delete(STRIP_HEADERS[i]);
+  const headers = cleanAndNormalizeHeaders(request.headers, targetUrl);
+
+  // 调试日志输出（可通过设置环境变量 DEBUG_HEADERS=1 或请求头 x-debug-headers: 1 开启）
+  if (DEBUG_HEADERS || request.headers.get('x-debug-headers') === '1' || url.searchParams.get('debug') === '1') {
+    console.log('[Relay Debug] 目标 URL:', targetUrl);
+    console.log('[Relay Debug] 原始入站 Headers:', Object.fromEntries(request.headers.entries()));
+    console.log('[Relay Debug] 出站清洗 Headers:', Object.fromEntries(headers.entries()));
   }
-
-  // 设置与目标地址一致的 Host
-  try {
-    const parsed = new URL(targetUrl);
-    headers.set('host', parsed.host);
-  } catch { }
-
-  // 强制明文，彻底禁用上游 gzip 窗口缓冲，保持打字机单字实时推送
-  headers.set('accept-encoding', 'identity');
-  headers.set('connection', 'keep-alive');
 
   // 3. 极速出站 fetch（纯透传）
   const upstreamResponse = await fetch(targetUrl, {
@@ -379,18 +543,14 @@ async function handlePrivatemode(request, url) {
   if (subPath !== '/' && !subPath.startsWith('/v1')) {
     subPath = '/v1' + subPath;
   }
-  const targetUrl = request.headers.get('x-target-url') || `${PRIVATEMODE_UPSTREAM}${subPath}${url.search}`;
+  const targetUrl = url.searchParams.get('url') || request.headers.get('x-target-url') || `${PRIVATEMODE_UPSTREAM}${subPath}${url.search}`;
 
-  // 2. 标头清洗
-  const headers = new Headers(request.headers);
-  for (let i = 0; i < STRIP_HEADERS.length; i++) {
-    headers.delete(STRIP_HEADERS[i]);
+  if (!isValidTargetUrl(targetUrl)) {
+    return new Response('Invalid target URL', { status: 400 });
   }
 
-  try {
-    const parsed = new URL(targetUrl);
-    headers.set('host', parsed.host);
-  } catch { }
+  // 3. 标头清洗与伪装：彻底剔除 Cloudflare 与 Vercel 代理特征
+  const headers = cleanAndNormalizeHeaders(request.headers, targetUrl);
 
   // 3. Privatemode 专用秘钥注入：使用服务端配置的 PRIVATEMODE_API_KEY
   if (PRIVATEMODE_API_KEY) {
@@ -479,18 +639,14 @@ async function handleClixad(request, url) {
     subPath = '/v1' + subPath;
   }
   const upstream = (request.headers.get('x-upstream-url') || CLIXAD_UPSTREAM).replace(/\/+$/, '');
-  const targetUrl = request.headers.get('x-target-url') || `${upstream}${subPath}${url.search}`;
+  const targetUrl = url.searchParams.get('url') || request.headers.get('x-target-url') || `${upstream}${subPath}${url.search}`;
 
-  // 4. 标头清洗
-  const headers = new Headers(request.headers);
-  for (let i = 0; i < STRIP_HEADERS.length; i++) {
-    headers.delete(STRIP_HEADERS[i]);
+  if (!isValidTargetUrl(targetUrl)) {
+    return new Response('Invalid target URL', { status: 400 });
   }
 
-  try {
-    const parsed = new URL(targetUrl);
-    headers.set('host', parsed.host);
-  } catch { }
+  // 4. 标头清洗与伪装：彻底剔除 Cloudflare 与 Vercel 代理特征
+  const headers = cleanAndNormalizeHeaders(request.headers, targetUrl);
 
   // 5. Clixad 自动秘钥解析与注入
   let token = await getStoredToken();
